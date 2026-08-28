@@ -1,0 +1,1438 @@
+--[[
+    LUNAR HUB - JNKIE key system  |  monochrome build
+    Luau (Roblox), client-side, executor
+
+    INLINE UI build, per https://docs.jnkie.com/roblox-sdk/inline-ui
+
+    -- WHERE THIS GOES ---------------------------------------------------
+    Dashboard -> Lua Scripts -> Lunar Hub -> UI-Source field.
+    Your actual hub script stays in the Original Code field.
+    Obfuscate this before pasting it in (the docs recommend Prometheus).
+
+    This file only validates a key and opens the gate. It must never
+    download the script itself - the public /download URL contains this
+    same UI code, so fetching it here would relaunch the key prompt in a
+    loop. That is the external-loader flow, and it is not this.
+
+    -- LOGO --------------------------------------------------------------
+    Three tiers, first one that works wins:
+      1. CONFIG.LOGO_ASSET   - a rbxassetid:// string you uploaded
+      2. CONFIG.LOGO_FILES   - a png in the executor workspace folder
+      3. procedural          - crescent + L drawn from frames, always works
+
+    -- HOW THE GATE WORKS ------------------------------------------------
+    Junkie.check_key(key) makes a blocking HTTP call to the JNKIE backend:
+      valid   -> { valid = true,  message = "KEY_VALID" | "KEYLESS" }
+      invalid -> { valid = false, error   = "KEY_INVALID" | "http 429" | ... }
+    On success the key goes into getgenv().SCRIPT_KEY. The while-loop at the
+    bottom holds execution until that happens; once it releases, JNKIE runs
+    your Original Code.
+]]
+
+--=====================================================================
+-- CONFIG
+--=====================================================================
+local CONFIG = {
+    -- All three verified against the dashboard on 2026-08-28.
+    SERVICE = "Lunar Hub",
+    IDENTIFIER = "1150425",
+    -- Dashboard -> Providers (NOT the Integrations entry, which is "Free key"
+    -- with a lowercase k and is the Work Ink integration, a different object)
+    PROVIDER = "Free Key",
+
+    DISCORD_URL = "https://discord.gg/lunarhub",
+    -- "discord" -> GET KEY opens DISCORD_URL
+    -- "jnkie"   -> GET KEY calls Junkie.get_key_link() instead
+    GET_KEY_MODE = "discord",
+
+    LOGO_ASSET = "",
+    LOGO_FILES = {"LunarHub/logo.png", "lunar_logo.png", "logo.png"},
+
+    VERSION = "v2.0",
+    MAX_ATTEMPTS = 5,
+    REQUEST_TIMEOUT = 20,
+}
+
+--=====================================================================
+-- SERVICES
+--=====================================================================
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local Lighting = game:GetService("Lighting")
+local CoreGui = game:GetService("CoreGui")
+local GuiService = game:GetService("GuiService")
+
+local lp = Players.LocalPlayer
+while not lp do
+    task.wait(0.05)
+    lp = Players.LocalPlayer
+end
+
+--=====================================================================
+-- PALETTE  (strict monochrome - state is carried by brightness, shape
+-- and motion instead of hue)
+--=====================================================================
+local C = {
+    Void = Color3.fromRGB(0, 0, 0),
+    Base = Color3.fromRGB(11, 11, 11),
+    Sidebar = Color3.fromRGB(7, 7, 7),
+    Card = Color3.fromRGB(16, 16, 16),
+    Field = Color3.fromRGB(22, 22, 22),
+    Raised = Color3.fromRGB(30, 30, 30),
+    Line = Color3.fromRGB(40, 40, 40),
+    LineSoft = Color3.fromRGB(26, 26, 26),
+
+    White = Color3.fromRGB(255, 255, 255),
+    Text = Color3.fromRGB(246, 246, 246),
+    Muted = Color3.fromRGB(150, 150, 150),
+    Dim = Color3.fromRGB(96, 96, 96),
+    Faint = Color3.fromRGB(58, 58, 58),
+    Ghost = Color3.fromRGB(34, 34, 34),
+}
+
+local SPRING = Enum.EasingStyle.Back
+local SMOOTH = Enum.EasingStyle.Quart
+local SOFT = Enum.EasingStyle.Sine
+
+--=====================================================================
+-- HELPERS
+--=====================================================================
+local function corner(inst, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius)
+    c.Parent = inst
+    return c
+end
+
+local function stroke(inst, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or C.Line
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = inst
+    return s
+end
+
+local function gradient(inst, from, to, rotation)
+    local g = Instance.new("UIGradient")
+    g.Color = ColorSequence.new(from, to)
+    g.Rotation = rotation or 0
+    g.Parent = inst
+    return g
+end
+
+local function tween(inst, duration, props, style, direction)
+    local t = TweenService:Create(
+        inst,
+        TweenInfo.new(duration, style or SMOOTH, direction or Enum.EasingDirection.Out),
+        props
+    )
+    t:Play()
+    return t
+end
+
+local function frame(parent, props)
+    local f = Instance.new("Frame")
+    f.BackgroundColor3 = C.Card
+    f.BorderSizePixel = 0
+    for k, v in pairs(props) do
+        f[k] = v
+    end
+    f.Parent = parent
+    return f
+end
+
+local function label(parent, props)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.Gotham
+    l.TextColor3 = C.Text
+    l.TextSize = 12
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+    for k, v in pairs(props) do
+        l[k] = v
+    end
+    l.Parent = parent
+    return l
+end
+
+-- Staggered entrance. Each element is hidden, then faded back to whatever
+-- transparency it was authored with, a couple of frames after the last one.
+local revealStep = 0
+
+local function reveal(inst)
+    revealStep = revealStep + 1
+    local wait = 0.14 + revealStep * 0.018
+    local restore = {}
+
+    if inst:IsA("UIStroke") then
+        restore.Transparency = inst.Transparency
+        inst.Transparency = 1
+    else
+        if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
+            restore.TextTransparency = inst.TextTransparency
+            inst.TextTransparency = 1
+        end
+        if inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
+            restore.ImageTransparency = inst.ImageTransparency
+            inst.ImageTransparency = 1
+        end
+        if inst.BackgroundTransparency < 1 then
+            restore.BackgroundTransparency = inst.BackgroundTransparency
+            inst.BackgroundTransparency = 1
+        end
+    end
+
+    task.delay(wait, function()
+        if inst.Parent then
+            tween(inst, 0.4, restore, SMOOTH)
+        end
+    end)
+
+    return inst
+end
+
+--=====================================================================
+-- SDK
+--=====================================================================
+getgenv().SCRIPT_KEY = nil
+getgenv().UI_CLOSED = false
+
+-- Minimal standalone panel for failures that happen before the real UI
+-- exists. Previously this path just returned, which looked identical to the
+-- script not running at all.
+local function fatal(headline, detail)
+    warn("[LunarHub] FATAL: " .. headline .. " | " .. tostring(detail))
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "LunarHubError"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 10000
+    if gethui then
+        gui.Parent = gethui()
+    else
+        pcall(function() gui.Parent = CoreGui end)
+    end
+    if not gui.Parent then
+        gui.Parent = lp:WaitForChild("PlayerGui")
+    end
+
+    local card = frame(gui, {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        BackgroundColor3 = C.Base,
+        Position = UDim2.new(0.5, 0, 0.5, 0),
+        Size = UDim2.fromOffset(400, 168),
+    })
+    corner(card, 14)
+    stroke(card, C.Line, 1.5)
+
+    frame(card, {
+        BackgroundColor3 = C.White,
+        Size = UDim2.new(1, 0, 0, 1),
+        ZIndex = 3,
+    })
+
+    label(card, {
+        Position = UDim2.fromOffset(22, 22),
+        Size = UDim2.new(1, -44, 0, 18),
+        Font = Enum.Font.GothamBlack,
+        Text = "LUNAR HUB",
+        TextSize = 15,
+    })
+
+    label(card, {
+        Position = UDim2.fromOffset(22, 46),
+        Size = UDim2.new(1, -44, 0, 16),
+        Font = Enum.Font.GothamBold,
+        Text = headline,
+        TextColor3 = C.Muted,
+        TextSize = 11,
+    })
+
+    label(card, {
+        Position = UDim2.fromOffset(22, 70),
+        Size = UDim2.new(1, -44, 0, 44),
+        Text = tostring(detail),
+        TextColor3 = C.Dim,
+        TextSize = 10,
+        TextWrapped = true,
+        TextTruncate = Enum.TextTruncate.None,
+        TextYAlignment = Enum.TextYAlignment.Top,
+    })
+
+    local dismiss = Instance.new("TextButton")
+    dismiss.AnchorPoint = Vector2.new(0.5, 1)
+    dismiss.BackgroundColor3 = C.White
+    dismiss.Position = UDim2.new(0.5, 0, 1, -20)
+    dismiss.Size = UDim2.new(1, -44, 0, 36)
+    dismiss.AutoButtonColor = false
+    dismiss.Font = Enum.Font.GothamBlack
+    dismiss.Text = "CLOSE  -  THEN RUN THE SCRIPT AGAIN"
+    dismiss.TextColor3 = C.Void
+    dismiss.TextSize = 11
+    dismiss.Parent = card
+    corner(dismiss, 9)
+
+    dismiss.MouseEnter:Connect(function()
+        tween(dismiss, 0.16, {BackgroundColor3 = Color3.fromRGB(220, 220, 220)})
+    end)
+    dismiss.MouseLeave:Connect(function()
+        tween(dismiss, 0.16, {BackgroundColor3 = C.White})
+    end)
+    dismiss.MouseButton1Click:Connect(function()
+        gui:Destroy()
+    end)
+end
+
+-- Three tries with backoff. A single transient failure here used to kill the
+-- whole script with nothing on screen.
+local Junkie
+local sdkError = "unknown"
+
+for attempt = 1, 3 do
+    local url = "https://jnkie.com/sdk/library.lua"
+    if attempt > 1 then
+        -- Some executors cache HttpGet responses, including failed ones
+        url = url .. "?r=" .. tostring(math.random(100000, 999999))
+    end
+
+    local fetchOk, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+
+    if not fetchOk then
+        sdkError = "request failed: " .. tostring(body)
+    elseif type(body) ~= "string" or body == "" then
+        sdkError = "empty response"
+    else
+        local chunk, compileErr = loadstring(body)
+        if not chunk then
+            sdkError = "not valid Lua: " .. tostring(compileErr)
+            warn("[LunarHub] SDK response began: " .. string.sub(body, 1, 140))
+        else
+            local runOk, result = pcall(chunk)
+            if not runOk then
+                sdkError = "SDK errored on load: " .. tostring(result)
+            elseif type(result) ~= "table" then
+                sdkError = "SDK returned a " .. type(result) .. ", expected a table"
+            else
+                Junkie = result
+                break
+            end
+        end
+    end
+
+    warn("[LunarHub] SDK attempt " .. attempt .. "/3 failed - " .. sdkError)
+    if attempt < 3 then
+        task.wait(attempt)
+    end
+end
+
+if not Junkie then
+    fatal("Could not reach the JNKIE key server", sdkError
+        .. "\nCheck your internet, then try again in a minute. If this keeps up, jnkie.com may be down or rate limiting you.")
+    return
+end
+
+Junkie.service = CONFIG.SERVICE
+Junkie.identifier = CONFIG.IDENTIFIER
+Junkie.provider = CONFIG.PROVIDER
+
+if type(Junkie.check_key) ~= "function" then
+    warn("[LunarHub] SDK exposes no check_key - validation cannot run")
+end
+
+--=====================================================================
+-- ROOT
+--=====================================================================
+pcall(function()
+    local holders = {CoreGui, Lighting}
+    if gethui then
+        table.insert(holders, gethui())
+    end
+    for _, holder in ipairs(holders) do
+        for _, v in ipairs(holder:GetChildren()) do
+            if v.Name == "LunarHubKeySystem" or v.Name == "LunarHubBlur" then
+                v:Destroy()
+            end
+        end
+    end
+end)
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "LunarHubKeySystem"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.DisplayOrder = 9999
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+if gethui then
+    ScreenGui.Parent = gethui()
+else
+    pcall(function() ScreenGui.Parent = CoreGui end)
+end
+if not ScreenGui.Parent then
+    ScreenGui.Parent = lp:WaitForChild("PlayerGui")
+end
+
+local Blur = Instance.new("BlurEffect")
+Blur.Name = "LunarHubBlur"
+Blur.Size = 0
+Blur.Parent = Lighting
+tween(Blur, 0.6, {Size = 26})
+
+local Backdrop = frame(ScreenGui, {
+    Name = "Backdrop",
+    BackgroundColor3 = C.Void,
+    BackgroundTransparency = 1,
+    Size = UDim2.fromScale(1, 1),
+    ZIndex = 1,
+})
+tween(Backdrop, 0.5, {BackgroundTransparency = 0.35})
+
+local Root = frame(ScreenGui, {
+    Name = "Root",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = C.Base,
+    Position = UDim2.new(0.5, 0, 0.53, 0),
+    Size = UDim2.fromOffset(596, 402),
+    ClipsDescendants = true,
+    ZIndex = 2,
+})
+corner(Root, 16)
+
+local RootStroke = stroke(Root, C.Line, 1.5)
+gradient(RootStroke, Color3.fromRGB(96, 96, 96), Color3.fromRGB(26, 26, 26), 90)
+
+tween(Root, 0.62, {
+    Size = UDim2.fromOffset(640, 432),
+    Position = UDim2.new(0.5, 0, 0.5, 0),
+}, SPRING)
+
+-- Hairline along the very top, with a highlight that drifts across it
+local TopLine = frame(Root, {
+    BackgroundColor3 = C.White,
+    Size = UDim2.new(1, 0, 0, 1),
+    ZIndex = 40,
+})
+local TopGrad = Instance.new("UIGradient")
+TopGrad.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1),
+    NumberSequenceKeypoint.new(0.35, 0.55),
+    NumberSequenceKeypoint.new(0.5, 0.15),
+    NumberSequenceKeypoint.new(0.65, 0.55),
+    NumberSequenceKeypoint.new(1, 1),
+})
+TopGrad.Parent = TopLine
+
+local uiAlive = true
+
+task.spawn(function()
+    local x = -1
+    while uiAlive do
+        x = x + 0.008
+        if x > 1 then x = -1 end
+        TopGrad.Offset = Vector2.new(x, 0)
+        task.wait(0.03)
+    end
+end)
+
+local function closeUI(markClosed)
+    if not uiAlive then return end
+    uiAlive = false
+    if markClosed then
+        getgenv().UI_CLOSED = true
+    end
+    tween(Backdrop, 0.32, {BackgroundTransparency = 1})
+    tween(Blur, 0.32, {Size = 0})
+    tween(Root, 0.3, {
+        Size = UDim2.fromOffset(600, 400),
+        Position = UDim2.new(0.5, 0, 0.55, 0),
+    }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+    task.delay(0.34, function()
+        pcall(function() ScreenGui:Destroy() end)
+        pcall(function() Blur:Destroy() end)
+    end)
+end
+
+local function shake()
+    local base = Root.Position
+    for i = 1, 6 do
+        local dx = (i % 2 == 0) and 10 or -10
+        tween(Root, 0.042, {Position = base + UDim2.fromOffset(dx, 0)}, SOFT)
+        task.wait(0.045)
+    end
+    tween(Root, 0.1, {Position = base}, SOFT)
+end
+
+--=====================================================================
+-- LOGO
+--=====================================================================
+-- Crescent is two circles: a white disc with a background-coloured disc
+-- laid over it and pushed right, leaving a sliver. The L sits in the gap.
+local function drawMoon(parent, size, bg, zIndex)
+    local holder = frame(parent, {
+        BackgroundTransparency = 1,
+        Size = UDim2.fromOffset(size, size),
+        ZIndex = zIndex,
+    })
+
+    local uploaded = false
+
+    if CONFIG.LOGO_ASSET ~= "" then
+        local img = Instance.new("ImageLabel")
+        img.BackgroundTransparency = 1
+        img.Size = UDim2.fromScale(1, 1)
+        img.ScaleType = Enum.ScaleType.Fit
+        img.Image = CONFIG.LOGO_ASSET
+        img.ZIndex = zIndex + 1
+        img.Parent = holder
+        uploaded = true
+    else
+        for _, path in ipairs(CONFIG.LOGO_FILES) do
+            local ok, exists = pcall(function() return isfile(path) end)
+            if ok and exists then
+                local asset
+                local gotIt = pcall(function() asset = getcustomasset(path) end)
+                if gotIt and asset and asset ~= "" then
+                    local img = Instance.new("ImageLabel")
+                    img.BackgroundTransparency = 1
+                    img.Size = UDim2.fromScale(1, 1)
+                    img.ScaleType = Enum.ScaleType.Fit
+                    img.Image = asset
+                    img.ZIndex = zIndex + 1
+                    img.Parent = holder
+                    uploaded = true
+                    break
+                end
+            end
+        end
+    end
+
+    if uploaded then
+        return holder
+    end
+
+    local disc = frame(holder, {
+        BackgroundColor3 = C.White,
+        Size = UDim2.fromScale(1, 1),
+        ZIndex = zIndex + 1,
+    })
+    corner(disc, math.floor(size / 2))
+
+    local bite = frame(holder, {
+        BackgroundColor3 = bg,
+        Position = UDim2.fromOffset(math.floor(size * 0.28), math.floor(size * 0.09)),
+        Size = UDim2.fromOffset(math.floor(size * 0.82), math.floor(size * 0.82)),
+        ZIndex = zIndex + 2,
+    })
+    corner(bite, math.floor(size * 0.41))
+
+    label(holder, {
+        Position = UDim2.fromOffset(math.floor(size * 0.30), 0),
+        Size = UDim2.new(1, -math.floor(size * 0.30), 1, 0),
+        Font = Enum.Font.Garamond,
+        Text = "L",
+        TextColor3 = C.White,
+        TextSize = math.floor(size * 0.72),
+        TextXAlignment = Enum.TextXAlignment.Center,
+        ZIndex = zIndex + 3,
+    })
+
+    return holder
+end
+
+--=====================================================================
+-- SIDEBAR
+--=====================================================================
+local Sidebar = frame(Root, {
+    Name = "Sidebar",
+    BackgroundColor3 = C.Sidebar,
+    Size = UDim2.new(0, 198, 1, 0),
+    ZIndex = 3,
+})
+corner(Sidebar, 16)
+
+frame(Sidebar, {
+    BackgroundColor3 = C.Sidebar,
+    Position = UDim2.new(1, -16, 0, 0),
+    Size = UDim2.new(0, 16, 1, 0),
+    ZIndex = 3,
+})
+
+frame(Sidebar, {
+    BackgroundColor3 = C.LineSoft,
+    Position = UDim2.new(1, 0, 0, 0),
+    Size = UDim2.new(0, 1, 1, 0),
+    ZIndex = 8,
+})
+
+-- Starfield behind the sidebar content, matching the logo's night sky
+local stars = {}
+for i = 1, 22 do
+    local size = (i % 5 == 0) and 2 or 1
+    local star = frame(Sidebar, {
+        BackgroundColor3 = C.White,
+        BackgroundTransparency = 0.55 + (i % 4) * 0.1,
+        Position = UDim2.fromOffset(
+            10 + (i * 47) % 176,
+            14 + (i * 83) % 372
+        ),
+        Size = UDim2.fromOffset(size, size),
+        ZIndex = 4,
+    })
+    corner(star, 1)
+    table.insert(stars, star)
+end
+
+task.spawn(function()
+    while uiAlive do
+        for _ = 1, 3 do
+            local star = stars[math.random(1, #stars)]
+            tween(star, 1.1, {BackgroundTransparency = 0.35 + math.random() * 0.5}, SOFT)
+        end
+        task.wait(0.7)
+    end
+end)
+
+local Moon = drawMoon(Sidebar, 40, C.Sidebar, 10)
+Moon.Position = UDim2.fromOffset(20, 22)
+
+local MoonScale = Instance.new("UIScale")
+MoonScale.Scale = 0.55
+MoonScale.Parent = Moon
+task.delay(0.12, function()
+    tween(MoonScale, 0.75, {Scale = 1}, SPRING)
+end)
+
+reveal(label(Sidebar, {
+    Position = UDim2.fromOffset(70, 24),
+    Size = UDim2.fromOffset(120, 17),
+    Font = Enum.Font.GothamBlack,
+    Text = "LUNAR HUB",
+    TextSize = 15,
+    ZIndex = 10,
+}))
+
+reveal(label(Sidebar, {
+    Position = UDim2.fromOffset(70, 42),
+    Size = UDim2.fromOffset(120, 13),
+    Text = "authentication",
+    TextColor3 = C.Faint,
+    TextSize = 10,
+    ZIndex = 10,
+}))
+
+reveal(frame(Sidebar, {
+    BackgroundColor3 = C.LineSoft,
+    Position = UDim2.fromOffset(20, 78),
+    Size = UDim2.new(1, -40, 0, 1),
+    ZIndex = 10,
+}))
+
+local rowY = 94
+
+local function sidebarRow(name, value)
+    local holder = frame(Sidebar, {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(20, rowY),
+        Size = UDim2.new(1, -40, 0, 32),
+        ZIndex = 10,
+    })
+
+    reveal(label(holder, {
+        Size = UDim2.new(1, 0, 0, 10),
+        Font = Enum.Font.GothamBold,
+        Text = name,
+        TextColor3 = C.Faint,
+        TextSize = 8,
+        ZIndex = 10,
+    }))
+
+    local val = reveal(label(holder, {
+        Position = UDim2.fromOffset(0, 12),
+        Size = UDim2.new(1, 0, 0, 14),
+        Font = Enum.Font.GothamMedium,
+        Text = value,
+        TextColor3 = C.Muted,
+        TextSize = 11,
+        ZIndex = 10,
+    }))
+
+    rowY = rowY + 38
+    return val
+end
+
+local displayName = "Player"
+pcall(function() displayName = lp.DisplayName or lp.Name or "Player" end)
+local userId = 0
+pcall(function() userId = lp.UserId or 0 end)
+
+local nameRow = sidebarRow("PLAYER", tostring(displayName))
+nameRow.TextColor3 = C.Text
+sidebarRow("USER ID", "#" .. tostring(userId))
+local HwidRow = sidebarRow("HARDWARE ID", "reading")
+local ExecRow = sidebarRow("EXECUTOR", "unknown")
+local PingRow = sidebarRow("PING", "--")
+local SessionRow = sidebarRow("SESSION", "00:00")
+
+task.spawn(function()
+    local ok, hwid = pcall(function()
+        return tostring(game:GetService("RbxAnalyticsService"):GetClientId()):sub(1, 12):upper()
+    end)
+    HwidRow.Text = (ok and hwid) and hwid or "UNAVAILABLE"
+end)
+
+task.spawn(function()
+    local ok, name = pcall(function()
+        if identifyexecutor then
+            return (identifyexecutor())
+        end
+        return nil
+    end)
+    ExecRow.Text = (ok and type(name) == "string" and name ~= "") and name or "UNKNOWN"
+end)
+
+task.spawn(function()
+    while uiAlive do
+        local ok, ping = pcall(function()
+            return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+        end)
+        PingRow.Text = (ok and ping) and (math.round(ping) .. " ms") or "UNAVAILABLE"
+        task.wait(2)
+    end
+end)
+
+task.spawn(function()
+    local secs = 0
+    while uiAlive do
+        task.wait(1)
+        secs = secs + 1
+        SessionRow.Text = string.format("%02d:%02d", math.floor(secs / 60), secs % 60)
+    end
+end)
+
+-- Status pill, pinned to the bottom
+local Pill = frame(Sidebar, {
+    BackgroundColor3 = C.Field,
+    AnchorPoint = Vector2.new(0, 1),
+    Position = UDim2.new(0, 20, 1, -20),
+    Size = UDim2.new(1, -40, 0, 32),
+    ZIndex = 10,
+})
+corner(Pill, 8)
+reveal(stroke(Pill, C.Line, 1))
+reveal(Pill)
+
+local PillDot = frame(Pill, {
+    BackgroundColor3 = C.Dim,
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 12, 0.5, 0),
+    Size = UDim2.fromOffset(7, 7),
+    ZIndex = 11,
+})
+corner(PillDot, 4)
+local PillRing = stroke(PillDot, C.White, 1, 1)
+
+local PillText = label(Pill, {
+    Position = UDim2.fromOffset(27, 0),
+    Size = UDim2.new(1, -34, 1, 0),
+    Font = Enum.Font.GothamBold,
+    Text = "AWAITING KEY",
+    TextColor3 = C.Dim,
+    TextSize = 9,
+    ZIndex = 11,
+})
+
+task.spawn(function()
+    while uiAlive do
+        tween(PillDot, 0.9, {BackgroundTransparency = 0.6}, SOFT, Enum.EasingDirection.InOut)
+        task.wait(0.95)
+        if not uiAlive then break end
+        tween(PillDot, 0.9, {BackgroundTransparency = 0}, SOFT, Enum.EasingDirection.InOut)
+        task.wait(0.95)
+    end
+end)
+
+--=====================================================================
+-- PANEL
+--=====================================================================
+local Panel = frame(Root, {
+    Name = "Panel",
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(199, 0),
+    Size = UDim2.new(1, -199, 1, 0),
+    ZIndex = 5,
+})
+
+local Handle = frame(Panel, {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 0, 58),
+    ZIndex = 6,
+})
+
+local dragging, dragOrigin, rootOrigin
+Handle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragOrigin = input.Position
+        rootOrigin = Root.Position
+    end
+end)
+Handle.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        local delta = input.Position - dragOrigin
+        Root.Position = rootOrigin + UDim2.fromOffset(delta.X, delta.Y)
+    end
+end)
+
+local GameLabel = reveal(label(Panel, {
+    Position = UDim2.fromOffset(26, 24),
+    Size = UDim2.new(1, -120, 0, 18),
+    Font = Enum.Font.GothamBlack,
+    Text = "LOADING GAME",
+    TextSize = 15,
+    ZIndex = 7,
+}))
+
+reveal(label(Panel, {
+    Position = UDim2.fromOffset(26, 43),
+    Size = UDim2.new(1, -120, 0, 14),
+    Text = "enter your key to unlock this script",
+    TextColor3 = C.Faint,
+    TextSize = 11,
+    ZIndex = 7,
+}))
+
+task.spawn(function()
+    local ok, info = pcall(function()
+        return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+    end)
+    GameLabel.Text = (ok and info and info.Name) and string.upper(info.Name) or "UNKNOWN GAME"
+end)
+
+-- Window buttons
+local function windowButton(offsetX, glyph, glyphSize, dangerous)
+    local b = Instance.new("TextButton")
+    b.BackgroundColor3 = C.Field
+    b.AnchorPoint = Vector2.new(1, 0)
+    b.Position = UDim2.new(1, offsetX, 0, 20)
+    b.Size = UDim2.fromOffset(27, 27)
+    b.AutoButtonColor = false
+    b.Font = Enum.Font.GothamBold
+    b.Text = glyph
+    b.TextColor3 = C.Dim
+    b.TextSize = glyphSize
+    b.ZIndex = 12
+    b.Parent = Panel
+    corner(b, 8)
+    local s = stroke(b, C.Line, 1)
+
+    b.MouseEnter:Connect(function()
+        tween(b, 0.18, {
+            BackgroundColor3 = dangerous and C.White or C.Raised,
+            TextColor3 = dangerous and C.Void or C.Text,
+        })
+        tween(s, 0.18, {Color = C.White, Transparency = dangerous and 0 or 0.55})
+    end)
+    b.MouseLeave:Connect(function()
+        tween(b, 0.18, {BackgroundColor3 = C.Field, TextColor3 = C.Dim})
+        tween(s, 0.18, {Color = C.Line, Transparency = 0})
+    end)
+
+    reveal(b)
+    reveal(s)
+    return b
+end
+
+-- Plain ASCII glyphs on purpose. \u{} escapes are Luau-only syntax and a
+-- Lua 5.1 obfuscator (Prometheus) refuses to parse them.
+local MinBtn = windowButton(-61, "-", 18, false)
+local CloseBtn = windowButton(-26, "X", 13, true)
+
+local minimized = false
+MinBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    tween(Root, 0.38, {
+        Size = minimized and UDim2.fromOffset(640, 58) or UDim2.fromOffset(640, 432),
+    }, SMOOTH)
+    MinBtn.Text = minimized and "+" or "-"
+end)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    closeUI(true)
+end)
+
+--=====================================================================
+-- CARD  (UIListLayout keeps every control on the same left edge and the
+-- same rhythm - the old hand-placed offsets were what looked crooked)
+--=====================================================================
+local Card = frame(Panel, {
+    BackgroundColor3 = C.Card,
+    Position = UDim2.fromOffset(26, 78),
+    Size = UDim2.new(1, -52, 0, 280),
+    ZIndex = 6,
+})
+corner(Card, 12)
+reveal(stroke(Card, C.LineSoft, 1))
+reveal(Card)
+
+local CardPad = Instance.new("UIPadding")
+CardPad.PaddingTop = UDim.new(0, 18)
+CardPad.PaddingBottom = UDim.new(0, 18)
+CardPad.PaddingLeft = UDim.new(0, 18)
+CardPad.PaddingRight = UDim.new(0, 18)
+CardPad.Parent = Card
+
+local CardList = Instance.new("UIListLayout")
+CardList.FillDirection = Enum.FillDirection.Vertical
+CardList.SortOrder = Enum.SortOrder.LayoutOrder
+CardList.Padding = UDim.new(0, 10)
+CardList.Parent = Card
+
+reveal(label(Card, {
+    LayoutOrder = 1,
+    Size = UDim2.new(1, 0, 0, 11),
+    Font = Enum.Font.GothamBold,
+    Text = "LICENSE KEY",
+    TextColor3 = C.Faint,
+    TextSize = 9,
+    ZIndex = 7,
+}))
+
+-- Input
+local Field = frame(Card, {
+    LayoutOrder = 2,
+    BackgroundColor3 = C.Field,
+    Size = UDim2.new(1, 0, 0, 46),
+    ZIndex = 7,
+})
+corner(Field, 10)
+local FieldStroke = stroke(Field, C.Line, 1)
+reveal(Field)
+reveal(FieldStroke)
+
+local clipboardRead = getclipboard or getclipboardtext
+local pasteWidth = clipboardRead and 60 or 0
+
+local KeyInput = Instance.new("TextBox")
+KeyInput.BackgroundTransparency = 1
+KeyInput.Position = UDim2.fromOffset(14, 0)
+KeyInput.Size = UDim2.new(1, -(28 + pasteWidth), 1, 0)
+KeyInput.Font = Enum.Font.GothamMedium
+KeyInput.PlaceholderText = "paste your key"
+KeyInput.PlaceholderColor3 = C.Faint
+KeyInput.Text = ""
+KeyInput.TextColor3 = C.Text
+KeyInput.TextSize = 13
+KeyInput.ClearTextOnFocus = false
+KeyInput.TextXAlignment = Enum.TextXAlignment.Left
+KeyInput.ZIndex = 8
+KeyInput.Parent = Field
+reveal(KeyInput)
+
+KeyInput.Focused:Connect(function()
+    tween(FieldStroke, 0.22, {Color = C.White, Transparency = 0.25})
+    tween(Field, 0.22, {BackgroundColor3 = C.Raised})
+end)
+
+if clipboardRead then
+    local PasteBtn = Instance.new("TextButton")
+    PasteBtn.BackgroundColor3 = C.Raised
+    PasteBtn.AnchorPoint = Vector2.new(1, 0.5)
+    PasteBtn.Position = UDim2.new(1, -8, 0.5, 0)
+    PasteBtn.Size = UDim2.fromOffset(50, 28)
+    PasteBtn.AutoButtonColor = false
+    PasteBtn.Font = Enum.Font.GothamBold
+    PasteBtn.Text = "PASTE"
+    PasteBtn.TextColor3 = C.Muted
+    PasteBtn.TextSize = 9
+    PasteBtn.ZIndex = 9
+    PasteBtn.Parent = Field
+    corner(PasteBtn, 7)
+
+    PasteBtn.MouseEnter:Connect(function()
+        tween(PasteBtn, 0.16, {BackgroundColor3 = C.White, TextColor3 = C.Void})
+    end)
+    PasteBtn.MouseLeave:Connect(function()
+        tween(PasteBtn, 0.16, {BackgroundColor3 = C.Raised, TextColor3 = C.Muted})
+    end)
+    PasteBtn.MouseButton1Click:Connect(function()
+        local ok, text = pcall(clipboardRead)
+        if ok and type(text) == "string" and text ~= "" then
+            KeyInput.Text = text
+        end
+    end)
+end
+
+-- Buttons. Each lives in a fixed-size holder so the hover lift and press
+-- squash never reflow the list around it.
+local function makeButton(order, height, text, primary)
+    local holder = frame(Card, {
+        LayoutOrder = order,
+        BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 0, height),
+        ZIndex = 7,
+    })
+
+    local btn = Instance.new("TextButton")
+    btn.AnchorPoint = Vector2.new(0.5, 0.5)
+    btn.Position = UDim2.fromScale(0.5, 0.5)
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundColor3 = primary and C.White or C.Field
+    btn.AutoButtonColor = false
+    btn.Font = primary and Enum.Font.GothamBlack or Enum.Font.GothamBold
+    btn.Text = text
+    btn.TextColor3 = primary and C.Void or C.Muted
+    btn.TextSize = primary and 13 or 11
+    btn.ClipsDescendants = true
+    btn.ZIndex = 8
+    btn.Parent = holder
+    corner(btn, 10)
+
+    local s = stroke(btn, primary and C.White or C.Line, 1, primary and 1 or 0)
+
+    local function restSize()
+        return UDim2.new(1, 0, 1, 0)
+    end
+
+    btn.MouseEnter:Connect(function()
+        tween(btn, 0.2, {
+            Size = UDim2.new(1, 4, 1, 3),
+            BackgroundColor3 = primary and Color3.fromRGB(226, 226, 226) or C.Raised,
+            TextColor3 = primary and C.Void or C.Text,
+        }, SMOOTH)
+        if not primary then
+            tween(s, 0.2, {Color = C.White, Transparency = 0.4})
+        end
+    end)
+    btn.MouseLeave:Connect(function()
+        tween(btn, 0.24, {
+            Size = restSize(),
+            BackgroundColor3 = primary and C.White or C.Field,
+            TextColor3 = primary and C.Void or C.Muted,
+        }, SMOOTH)
+        if not primary then
+            tween(s, 0.24, {Color = C.Line, Transparency = 0})
+        end
+    end)
+    btn.MouseButton1Down:Connect(function()
+        tween(btn, 0.09, {
+            Size = UDim2.new(1, -8, 1, -5),
+            BackgroundColor3 = primary and Color3.fromRGB(196, 196, 196) or C.Ghost,
+        }, SMOOTH)
+    end)
+    btn.MouseButton1Up:Connect(function()
+        tween(btn, 0.26, {Size = UDim2.new(1, 4, 1, 3)}, SPRING)
+    end)
+
+    reveal(btn)
+    return btn, s, holder
+end
+
+local VerifyBtn, VerifyStroke = makeButton(3, 46, "VERIFY AND LOAD", true)
+local GetKeyBtn, GetKeyStroke = makeButton(4, 40,
+    CONFIG.GET_KEY_MODE == "discord" and "GET A KEY  -  DISCORD" or "GET A KEY  -  COPY LINK", false)
+
+-- Shine that sweeps the primary button while a request is in flight
+local Sweep = frame(VerifyBtn, {
+    BackgroundColor3 = C.Void,
+    BackgroundTransparency = 0.86,
+    Position = UDim2.new(-0.45, 0, 0, 0),
+    Size = UDim2.new(0.45, 0, 1, 0),
+    Visible = false,
+    ZIndex = 9,
+})
+local SweepFade = Instance.new("UIGradient")
+SweepFade.Transparency = NumberSequence.new({
+    NumberSequenceKeypoint.new(0, 1),
+    NumberSequenceKeypoint.new(0.5, 0),
+    NumberSequenceKeypoint.new(1, 1),
+})
+SweepFade.Parent = Sweep
+
+local function startSweep()
+    if Sweep.Visible then return end
+    Sweep.Visible = true
+    task.spawn(function()
+        while Sweep.Visible and uiAlive do
+            Sweep.Position = UDim2.new(-0.45, 0, 0, 0)
+            tween(Sweep, 0.85, {Position = UDim2.new(1, 0, 0, 0)}, Enum.EasingStyle.Linear)
+            task.wait(0.9)
+        end
+    end)
+end
+
+local function stopSweep()
+    Sweep.Visible = false
+    Sweep.Position = UDim2.new(-0.45, 0, 0, 0)
+end
+
+reveal(frame(Card, {
+    LayoutOrder = 5,
+    BackgroundColor3 = C.LineSoft,
+    Size = UDim2.new(1, 0, 0, 1),
+    ZIndex = 7,
+}))
+
+-- Status row
+local StatusRow = frame(Card, {
+    LayoutOrder = 6,
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 0, 18),
+    ZIndex = 7,
+})
+
+local StatusDot = frame(StatusRow, {
+    BackgroundColor3 = C.Faint,
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 1, 0.5, 0),
+    Size = UDim2.fromOffset(6, 6),
+    ZIndex = 8,
+})
+corner(StatusDot, 3)
+local StatusRing = stroke(StatusDot, C.White, 1, 1)
+
+local StatusText = reveal(label(StatusRow, {
+    Position = UDim2.fromOffset(15, 0),
+    Size = UDim2.new(1, -95, 1, 0),
+    Font = Enum.Font.GothamMedium,
+    Text = "waiting for a key",
+    TextColor3 = C.Dim,
+    TextSize = 11,
+    ZIndex = 8,
+}))
+
+local AttemptText = reveal(label(StatusRow, {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, 0, 0, 0),
+    Size = UDim2.fromOffset(80, 18),
+    Font = Enum.Font.GothamBold,
+    Text = "",
+    TextColor3 = C.Faint,
+    TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    ZIndex = 8,
+}))
+
+-- Footer
+reveal(label(Panel, {
+    AnchorPoint = Vector2.new(0, 1),
+    Position = UDim2.new(0, 26, 1, -12),
+    Size = UDim2.new(0, 240, 0, 14),
+    Text = "LUNAR HUB " .. CONFIG.VERSION .. "  -  protected by JNKIE",
+    TextColor3 = Color3.fromRGB(44, 44, 44),
+    TextSize = 9,
+    ZIndex = 7,
+}))
+
+reveal(label(Panel, {
+    AnchorPoint = Vector2.new(1, 1),
+    Position = UDim2.new(1, -26, 1, -12),
+    Size = UDim2.fromOffset(120, 14),
+    Text = CONFIG.SERVICE,
+    TextColor3 = Color3.fromRGB(44, 44, 44),
+    TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    ZIndex = 7,
+}))
+
+--=====================================================================
+-- STATUS
+--=====================================================================
+-- No colour to lean on, so states differ by shape: idle and busy are a
+-- dim filled dot, success is a solid white dot, failure is a hollow ring.
+local function setStatus(message, state, pillOverride)
+    StatusText.Text = message
+
+    if state == "ok" then
+        StatusText.TextColor3 = C.Text
+        tween(StatusDot, 0.2, {BackgroundColor3 = C.White, BackgroundTransparency = 0})
+        tween(StatusRing, 0.2, {Transparency = 1})
+        PillText.Text = pillOverride or "AUTHENTICATED"
+        PillText.TextColor3 = C.Text
+        tween(PillDot, 0.2, {BackgroundColor3 = C.White})
+        tween(PillRing, 0.2, {Transparency = 1})
+    elseif state == "bad" then
+        StatusText.TextColor3 = C.Text
+        tween(StatusDot, 0.2, {BackgroundTransparency = 1})
+        tween(StatusRing, 0.2, {Transparency = 0})
+        PillText.Text = pillOverride or "REJECTED"
+        PillText.TextColor3 = C.Muted
+        tween(PillDot, 0.2, {BackgroundTransparency = 1})
+        tween(PillRing, 0.2, {Transparency = 0})
+    else
+        StatusText.TextColor3 = C.Dim
+        tween(StatusDot, 0.2, {BackgroundColor3 = C.Muted, BackgroundTransparency = 0})
+        tween(StatusRing, 0.2, {Transparency = 1})
+        PillText.Text = pillOverride or "AWAITING KEY"
+        PillText.TextColor3 = C.Dim
+        tween(PillDot, 0.2, {BackgroundColor3 = C.Dim, BackgroundTransparency = 0})
+        tween(PillRing, 0.2, {Transparency = 1})
+    end
+end
+
+-- https://docs.jnkie.com/roblox-sdk/inline-ui
+local REASONS = {
+    KEY_INVALID = "That key does not exist",
+    KEY_EXPIRED = "Key expired - grab a fresh one",
+    KEY_INVALIDATED = "This key was disabled",
+    -- The Free Key provider issues one-time-use keys, so this fires whenever a
+    -- key is validated twice, including re-testing the same key yourself.
+    ALREADY_USED = "Key already redeemed - generate a new one",
+    HWID_BANNED = "This hardware is banned",
+    HWID_MISMATCH = "Key is locked to another device",
+    SERVICE_NOT_FOUND = "Service missing - check the dashboard",
+    SERVICE_MISMATCH = "Key belongs to a different service",
+    PREMIUM_REQUIRED = "This script needs a premium key",
+    RATE_LIMITED = "Rate limited - wait five minutes",
+    ERROR = "Network error - try again",
+}
+
+local function explain(raw)
+    raw = tostring(raw)
+    if REASONS[raw] then
+        return REASONS[raw]
+    end
+    if raw:match("^http %d+") then
+        return "Server said " .. raw
+    end
+    return raw
+end
+
+--=====================================================================
+-- KEY HANDLING
+--=====================================================================
+-- Keys copied out of a browser or Discord drag along zero-width and control
+-- characters that survive a plain trim and silently break equality.
+local function cleanKey(text)
+    text = tostring(text or "")
+    text = text:gsub("\226\128\139", ""):gsub("\226\128\140", ""):gsub("\239\187\191", "")
+    text = text:gsub("[%z\1-\31\127]", "")
+    return (text:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+local busy = false
+local attempts = 0
+
+local function unlock()
+    stopSweep()
+    VerifyBtn.Text = "VERIFY AND LOAD"
+    busy = false
+end
+
+local function reject(message, raw)
+    warn("[LunarHub] rejected: " .. tostring(raw or message))
+    setStatus(message, "bad")
+    unlock()
+
+    -- Invert the button for a beat. Without colour this is the loudest
+    -- signal available that something went wrong.
+    VerifyBtn.BackgroundColor3 = C.Void
+    VerifyBtn.TextColor3 = C.White
+    tween(VerifyStroke, 0.12, {Transparency = 0})
+    task.delay(0.5, function()
+        tween(VerifyBtn, 0.4, {BackgroundColor3 = C.White, TextColor3 = C.Void})
+        tween(VerifyStroke, 0.4, {Transparency = 1})
+    end)
+
+    tween(FieldStroke, 0.1, {Color = C.White, Transparency = 0})
+    task.delay(0.6, function()
+        tween(FieldStroke, 0.45, {Color = C.Line, Transparency = 0})
+    end)
+
+    task.spawn(shake)
+end
+
+-- Opens the gate. SCRIPT_KEY is assigned last, on purpose: the while-loop at
+-- the bottom is watching it, so setting it earlier would let the Original Code
+-- start running underneath a UI that is still on screen.
+local function handOff(key)
+    setStatus("Key accepted - starting up", "ok")
+    VerifyBtn.Text = "LOADING HUB"
+    task.wait(0.5)
+    closeUI(false)
+    task.wait(0.32)
+    getgenv().SCRIPT_KEY = key
+end
+
+local function verify()
+    if busy then return end
+
+    local key = cleanKey(KeyInput.Text)
+    if key == "" then
+        setStatus("Enter a key first", "idle")
+        tween(FieldStroke, 0.12, {Color = C.White, Transparency = 0.2})
+        task.delay(0.5, function()
+            tween(FieldStroke, 0.4, {Color = C.Line, Transparency = 0})
+        end)
+        task.spawn(shake)
+        return
+    end
+
+    if attempts >= CONFIG.MAX_ATTEMPTS then
+        setStatus("Too many attempts - rerun the script", "bad", "LOCKED OUT")
+        return
+    end
+
+    busy = true
+    VerifyBtn.Text = "VERIFYING"
+    setStatus("Checking with JNKIE", "idle", "VERIFYING")
+    startSweep()
+
+    task.spawn(function()
+        local answered = false
+
+        -- check_key blocks on HTTP. Without this, a request that never returns
+        -- leaves the button reading VERIFYING with no explanation.
+        task.delay(CONFIG.REQUEST_TIMEOUT, function()
+            if answered then return end
+            answered = true
+            reject("JNKIE did not respond in time", "TIMEOUT")
+        end)
+
+        local ok, result = pcall(function()
+            return Junkie.check_key(key)
+        end)
+
+        if answered then return end
+        answered = true
+
+        if not ok then
+            attempts = attempts + 1
+            return reject("SDK error - see console", result)
+        end
+
+        if type(result) ~= "table" then
+            attempts = attempts + 1
+            return reject("Unexpected SDK response - see console", tostring(result))
+        end
+
+        if not result.valid then
+            attempts = attempts + 1
+            local raw = tostring(result.error or result.message or "VALIDATION FAILED")
+            reject(explain(raw), raw)
+            AttemptText.Text = attempts .. " / " .. CONFIG.MAX_ATTEMPTS
+
+            if raw == "HWID_BANNED" then
+                task.delay(2.5, function()
+                    pcall(function() lp:Kick("Hardware banned") end)
+                end)
+            end
+            return
+        end
+
+        stopSweep()
+        AttemptText.Text = ""
+        handOff(key)
+    end)
+end
+
+VerifyBtn.MouseButton1Click:Connect(verify)
+
+KeyInput.FocusLost:Connect(function(enterPressed)
+    tween(FieldStroke, 0.25, {Color = C.Line, Transparency = 0})
+    tween(Field, 0.25, {BackgroundColor3 = C.Field})
+    if enterPressed then
+        verify()
+    end
+end)
+
+--=====================================================================
+-- GET KEY
+--=====================================================================
+local function copyToClipboard(text)
+    if setclipboard then
+        return (pcall(setclipboard, text))
+    elseif toclipboard then
+        return (pcall(toclipboard, text))
+    end
+    return false
+end
+
+local function handOverLink(url)
+    print("[LunarHub] key link: " .. url)
+
+    -- Roblox's in-app browser. Not present in every environment, so the
+    -- clipboard is the fallback and the input box is the last resort.
+    local opened = pcall(function()
+        GuiService:OpenBrowserWindow(url)
+    end)
+    local copied = copyToClipboard(url)
+
+    if opened then
+        setStatus("Opened in your browser", "ok", "LINK SENT")
+    elseif copied then
+        setStatus("Link copied - paste it in a browser", "ok", "LINK COPIED")
+    else
+        KeyInput.Text = url
+        setStatus("No clipboard here - link is in the box", "idle", "LINK SHOWN")
+    end
+end
+
+local linkBusy = false
+
+GetKeyBtn.MouseButton1Click:Connect(function()
+    if linkBusy then return end
+    linkBusy = true
+
+    local restore = GetKeyBtn.Text
+
+    task.spawn(function()
+        if CONFIG.GET_KEY_MODE == "discord" then
+            GetKeyBtn.Text = "OPENING DISCORD"
+            handOverLink(CONFIG.DISCORD_URL)
+        else
+            GetKeyBtn.Text = "REQUESTING LINK"
+            -- get_key_link() takes no arguments and returns (link, error)
+            local ok, link, err = pcall(function()
+                return Junkie.get_key_link()
+            end)
+
+            if not ok then
+                warn("[LunarHub] get_key_link errored: " .. tostring(link))
+                setStatus("Could not request a link - see console", "bad", "LINK FAILED")
+            elseif type(link) == "string" and link ~= "" then
+                handOverLink(link)
+            else
+                local raw = tostring(err or "ERROR")
+                warn("[LunarHub] get_key_link failed: " .. raw)
+                setStatus(explain(raw), "bad", "LINK FAILED")
+            end
+        end
+
+        tween(GetKeyStroke, 0.2, {Color = C.White, Transparency = 0.35})
+        task.wait(1.7)
+        tween(GetKeyStroke, 0.3, {Color = C.Line, Transparency = 0})
+        GetKeyBtn.Text = restore
+        linkBusy = false
+    end)
+end)
+
+--=====================================================================
+-- GATE
+--=====================================================================
+print("[LunarHub] inline UI ready - service=" .. CONFIG.SERVICE .. " provider=" .. CONFIG.PROVIDER)
+
+while not getgenv().SCRIPT_KEY and not getgenv().UI_CLOSED do
+    task.wait(0.1)
+end
+
+if not getgenv().SCRIPT_KEY then
+    warn("[LunarHub] closed without a valid key")
+    return
+end
+
+-- Gate is open. JNKIE runs your Original Code from here.
